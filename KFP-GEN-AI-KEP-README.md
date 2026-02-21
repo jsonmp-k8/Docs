@@ -1156,6 +1156,12 @@ Example rendering of an agent conversation:
 └────────────────────────────────────────────────────┘
 ```
 
+**Interactive UI Mockup:**
+
+The following screenshot shows a working mockup of the AI Assistant panel analyzing a failed pipeline run, demonstrating tool call visualization, root cause analysis, code suggestions with compilation badges, and action buttons:
+
+![KFP Gen AI Assistant Mockup](images/kfp-genai-assistant-mockup.png)
+
 #### Inline AI Features
 
 Context-specific AI actions integrated into existing UI surfaces:
