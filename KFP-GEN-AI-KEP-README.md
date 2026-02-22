@@ -869,6 +869,12 @@ responses:
 
 ```protobuf
 service AIService {
+  // Feature enablement check. Returns whether AI features are enabled and
+  // configured. The frontend calls this on load to decide whether to render
+  // AI UI elements. Returns provider name (without credentials) so the UI
+  // can display which model is backing the assistant.
+  rpc GetAIStatus(GetAIStatusRequest) returns (GetAIStatusResponse);
+
   // Primary agentic chat endpoint. The LLM dynamically invokes tools
   // during the conversation. Replaces the fixed-RPC approach.
   rpc Chat(ChatRequest) returns (stream ChatStreamEvent);
@@ -890,14 +896,26 @@ service AIService {
   rpc ToggleRule(ToggleRuleRequest) returns (ToggleRuleResponse);
 }
 
+message GetAIStatusRequest {}
+
+message GetAIStatusResponse {
+  bool enabled = 1;          // Whether AI features are enabled
+  string provider = 2;       // Provider name (e.g., "anthropic", "openai")
+  string model = 3;          // Model name (e.g., "claude-sonnet-4-20250514")
+}
+
 // --- Chat ---
 
 message ChatRequest {
   string message = 1;
   string conversation_id = 2;  // For multi-turn context
-  string namespace = 3;        // Scope queries to a namespace
+  string namespace = 3;        // Scope queries to a namespace (validated server-side
+                               // against the user's allowed namespaces in multi-user mode)
   ChatMode mode = 4;           // Ask or Agent mode
-  PageContext page_context = 5; // Current UI page for auto context gathering
+  PageContext page_context = 5; // Current UI page for auto context gathering.
+                               // Contains resource IDs (run_id, pipeline_id, etc.) that the
+                               // context builder uses to fetch relevant data. The namespace
+                               // for authorization is taken from field 3, not from PageContext.
   RequestToolSelection tool_selection = 6; // Which tools to enable
 }
 
@@ -996,6 +1014,24 @@ message FinalEvent {
   int32 tokens_used = 1;
   string conversation_id = 2;
 }
+
+// --- Error Contracts ---
+// The AI service returns structured gRPC errors for budget and rate-limit scenarios:
+//
+// - RESOURCE_EXHAUSTED (code 8): Returned when the per-user rate limit is exceeded.
+//   The error detail includes a RetryInfo with the retry_delay field indicating
+//   when the client may retry.
+//
+// - FAILED_PRECONDITION (code 9): Returned when the token budget for the session
+//   or user is exhausted. The error message indicates whether this is a per-session
+//   or per-user budget limit.
+//
+// - UNAVAILABLE (code 14): Returned when the upstream LLM provider is unreachable
+//   or returns a server error (5xx). The client should retry with backoff.
+//
+// Tool execution errors are NOT returned as gRPC errors. Instead, they are returned
+// as ToolResultEvent with is_error=true, allowing the LLM to gracefully handle
+// the failure and inform the user within the conversation flow.
 
 // --- Tool Approval ---
 
@@ -1252,6 +1288,18 @@ code = generate_pipeline(
   administrator explicitly configures the provider.
 - **Credential isolation**: API keys are stored in Kubernetes Secrets, never in ConfigMaps or
   environment variables logged to stdout.
+- **Identity binding**: Each chat session is bound to the authenticated user identity at creation
+  time. The session manager stores the user identity (extracted from the request context) and
+  validates it on every subsequent request to the same session. This prevents session hijacking
+  where one user could access another user's conversation or pending tool approvals.
+- **Approve/Deny ownership**: Tool approval requests (`ApproveToolCall`) validate that the user
+  submitting the approval is the same user who owns the session. This prevents a malicious user
+  from approving a mutating action in another user's session.
+- **Authorization before context fetch**: The context builder must perform authorization checks
+  before fetching any resource data for inclusion in LLM prompts. When gathering page context
+  (e.g., run details, pipeline specs), the system verifies that the requesting user has read
+  access to the referenced resources in their namespace before retrieving and including the data.
+  This prevents information disclosure through crafted `PageContext` fields.
 - **Context filtering**: Administrators configure which categories of pipeline data
   (logs, parameters, metrics, artifacts, pipeline specs) may be sent to the LLM provider.
 - **Secret redaction**: Environment variable values, secret references, and credential-like strings
@@ -1264,12 +1312,24 @@ code = generate_pipeline(
   type, and token count (but not the prompt or response content). Tool invocations are logged
   individually, including whether they were auto-approved or user-confirmed.
 - **RBAC**: AI endpoints respect existing KFP RBAC. In multi-user mode, users can only query
-  pipelines and runs within their authorized namespaces.
+  pipelines and runs within their authorized namespaces. Every built-in tool delegates to the
+  existing `ResourceManager` methods, which enforce namespace-scoped authorization. List
+  operations require a namespace or experiment ID in multi-user mode.
+- **Namespace handling**: The `namespace` field in `ChatRequest` is validated server-side against
+  the authenticated user's allowed namespaces. The server never trusts the client-supplied
+  namespace without verification. In multi-user mode, omitting the namespace causes list
+  operations to return an error rather than returning cross-namespace results.
+- **Auth failure behavior**: Authorization failures in tool execution and context gathering return
+  structured error responses (not raw HTTP errors) so the LLM can gracefully inform the user.
+  For example, a tool returning `ToolResult{Content: "access denied", IsError: true}` allows
+  the agent to explain the permission issue rather than crashing the conversation.
 - **Secured tool wrapping**: All mutating tools and all external tools (MCP, extensions) require
   explicit user confirmation before execution. This is enforced at the framework level, not per
   tool, preventing a tool author from accidentally bypassing the confirmation requirement.
 - **MCP server allowlisting**: Only MCP servers explicitly configured by the administrator are
-  connected. There is no auto-discovery of MCP servers on the network.
+  connected. There is no auto-discovery of MCP servers on the network. MCP server URLs are
+  validated to prevent SSRF attacks — localhost, link-local, and cloud metadata endpoints are
+  blocked.
 
 ### Test Plan
 
@@ -1288,6 +1348,20 @@ code = generate_pipeline(
 | `backend/src/apiserver/ai/rules` | 80%+ | Rule parsing (Markdown + YAML frontmatter), scope matching, priority ordering, rule injection into prompts |
 | `backend/src/apiserver/ai/mcp` | 80%+ | MCP server connection, tool discovery, transport handling (HTTP + stdio), status management |
 | `frontend/src/components/AIAssistant` | 70%+ | Panel rendering, mode switching, streaming display, confirmation dialogs, tool call visualization, rich response types |
+
+#### Security Tests
+
+| Scenario | Test Description |
+|----------|-----------------|
+| Session hijacking | User A creates a session; User B attempts to send a message to the same session ID. Verify the request is rejected with an authorization error. |
+| Approval ownership | User A's session has a pending tool confirmation; User B calls `ApproveToolCall` with the same session and confirmation ID. Verify the approval is rejected. |
+| Cross-namespace access | User sends a `ChatRequest` with a namespace they are not authorized for in multi-user mode. Verify the request is rejected before any LLM call is made. |
+| Context builder auth | `PageContext` references a run_id in a namespace the user cannot access. Verify the context builder returns empty context (not the run data) and does not leak information. |
+| List without namespace | In multi-user mode, a tool call to `list_runs` without a namespace or experiment_id. Verify it returns a structured error, not cross-namespace results. |
+| MCP SSRF prevention | Attempt to configure an MCP server URL pointing to `http://169.254.169.254/` (cloud metadata) or `http://localhost:8080/`. Verify the URL is rejected at connection time. |
+| Rate limit enforcement | Single user sends requests exceeding the configured rate limit. Verify `RESOURCE_EXHAUSTED` error is returned with `RetryInfo`. |
+| Mutating tool in Ask mode | Force a tool call to a mutating tool while in Ask mode. Verify `SecuredTool.IsBlocked()` returns true and the tool is not executed. |
+| Secret redaction | Pipeline parameters containing strings matching secret patterns (e.g., `AKIA...`, `sk-...`) are included in context. Verify they are redacted before being sent to the LLM provider. |
 
 #### Integration Tests
 
@@ -1333,23 +1407,30 @@ code = generate_pipeline(
 - Basic secret redaction in prompts.
 - Documentation for administrator setup.
 
-#### Beta
+#### Beta — Required
 
 - All four provider implementations (OpenAI, Vertex AI, Bedrock, self-hosted) with model
   discovery support.
 - Agent mode with mutating tools (`create_run`, `create_pipeline_version`, etc.) and
   confirmation dialogs.
 - Prompt rules system with ConfigMap-based rule storage, scope matching, and admin toggle.
-- MCP server support (KFP as MCP server + consuming external MCP servers).
-- Extension point for custom tools.
 - Full rich streaming responses (all event types including ConfirmationRequest, ProgressEvent,
   ActionButton).
 - Auto context gathering for all page types.
 - Rate limiting and token budget enforcement.
 - Audit logging for all AI operations and tool invocations.
 - Comprehensive context filtering controls.
-- SDK `kfp[ai]` extension.
 - Inline AI features on run/pipeline detail pages.
+- Feature enablement endpoint (`GetAIStatus` RPC) for frontend gating.
+- Identity binding and session ownership validation for all chat and approval endpoints.
+- Authorization checks in context builder before fetching resource data.
+- Structured error responses for rate-limit, budget, and authorization failures.
+
+#### Beta — Optional (can slip to Stable)
+
+- MCP server support (KFP as MCP server + consuming external MCP servers).
+- Extension point for custom tools.
+- SDK `kfp[ai]` extension.
 
 #### Stable
 
@@ -1388,7 +1469,19 @@ This proposal has significant frontend impact:
 - **Error handling**: Graceful handling of LLM provider errors, rate limit exceeded, and timeout
   scenarios.
 
-No changes to existing frontend components are required. The AI features are purely additive.
+While the AI assistant panel itself is a new additive component, integration into the existing
+frontend requires modifications to several existing files:
+
+- **`Router.tsx`**: Modified to conditionally render the `AIAssistantPanel` within `SideNavLayout`
+  when the AI feature flag is enabled. This is the primary integration point.
+- **`RunDetails.tsx`**: Modified to add an "Analyze Failure" toolbar button that opens the AI
+  panel with a pre-filled prompt and run context when a run is in a failed state.
+- **`PipelineDetails.tsx`**: Modified to add "Generate Docs" and "Suggest Optimizations" toolbar
+  buttons that open the AI panel with appropriate context.
+- **`features.ts`**: New `AI_ASSISTANT` feature key added to the existing feature flag system.
+
+These modifications are minimal (adding conditional buttons and a panel mount point) but they
+do touch existing components, so they require review from frontend maintainers.
 
 ## KFP Local Considerations
 
